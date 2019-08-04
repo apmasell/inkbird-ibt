@@ -3,10 +3,43 @@ use byteorder::ByteOrder;
 use ctrlc;
 use prometheus::Encoder;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
 use std::thread;
+macro_rules! wait_fail {
+    ($res:expr, $interrupt_main:expr) => {
+        match $res {
+            Ok(val) => val,
+            Err(e) => {
+                println!("Bluetooth Error: {}; waiting.", e);
+                (*$interrupt_main).1
+                    .wait_timeout(
+                        (*$interrupt_main).0.lock().unwrap(),
+                        std::time::Duration::from_secs(60))
+                    .unwrap();
+                continue;
+            }
+        }
+    };
+}
+
+macro_rules! wait_fail_option {
+    ($res:expr, $interrupt_main:expr) => {
+        match $res {
+            Some(val) => val,
+            None => {
+                println!("Cannot find entry; waiting.");
+                (*$interrupt_main).1
+                    .wait_timeout(
+                        (*$interrupt_main).0.lock().unwrap(),
+                        std::time::Duration::from_secs(60))
+                    .unwrap();
+                continue;
+                }
+        }
+    };
+}
 
 fn main() {
     let matches = clap::App::new("Inkbird Prometheus Exporter")
@@ -28,89 +61,11 @@ fn main() {
     let gauge = prometheus::GaugeVec::new(opts, &vec!["probe"]).unwrap();
     registry.register(Box::new(gauge.clone())).unwrap();
 
-    println!("Connection to Bluez");
-    let session = blurz::BluetoothSession::create_session(None).unwrap();
-    let adapter = blurz::BluetoothAdapter::init(&session).unwrap();
-    println!("Finding device");
-    let device = adapter
-        .get_device_list()
-        .unwrap()
-        .iter()
-        .map(|path| blurz::BluetoothDevice::new(&session, path.clone()))
-        .filter(|d| d.get_name().unwrap() == "iBBQ")
-        .nth(0)
-        .expect("Cannot find device.");
-    println!("Connecting to device");
-    device.connect(10_000).unwrap();
-    println!("Finding services");
-    let services: HashMap<_, _> = device
-        .get_gatt_services()
-        .unwrap()
-        .iter()
-        .map(|path| {
-            let service = blurz::BluetoothGATTService::new(&session, path.clone());
-            (service.get_uuid().unwrap(), service)
-        })
-        .collect();
-    let characteristics: HashMap<_, _> = services
-        .iter()
-        .flat_map(|(_, service)| {
-            service
-                .get_gatt_characteristics()
-                .unwrap()
-                .iter()
-                .map(|path| {
-                    let characteristic =
-                        blurz::BluetoothGATTCharacteristic::new(&session, path.clone());
-                    (characteristic.get_uuid().unwrap(), characteristic)
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-        })
-        .collect();
-
-    println!("Authorising");
-    // Authorise to device with magic data
-    characteristics["0000fff2-0000-1000-8000-00805f9b34fb"]
-        .write_value(
-            vec![
-                0x21,
-                0x07,
-                0x06,
-                0x05,
-                0x04,
-                0x03,
-                0x02,
-                0x01,
-                0xb8,
-                0x22,
-                0x00,
-                0x00,
-                0x00,
-                0x00,
-                0x00,
-            ],
-            None,
-        )
-        .unwrap();
-    println!("Starting data collection");
-    // Enable realtime data collection
-    characteristics["0000fff5-0000-1000-8000-00805f9b34fb"]
-        .write_value(vec![0x0B, 0x01, 0x00, 0x00, 0x00, 0x00], None)
-        .unwrap();
-    // Subscribe to realtime data collection
-    if !characteristics["0000fff4-0000-1000-8000-00805f9b34fb"]
-        .is_notifying()
-        .unwrap()
-    {
-        characteristics["0000fff4-0000-1000-8000-00805f9b34fb"]
-            .start_notify()
-            .unwrap();
-    }
+    let interrupt_main = Arc::new((Mutex::new(true), Condvar::new()));
+    let interrupt_interrupter = interrupt_main.clone();
+    let interrupt_server = interrupt_main.clone();
 
     println!("Starting HTTP server");
-    let running = Arc::new(AtomicBool::new(true));
-    let running_server = running.clone();
     let server = thread::spawn(move || {
         HttpServer::new(move || {
             let metrics_registry = registry.clone();
@@ -129,48 +84,153 @@ fn main() {
             .run()
             .unwrap();
 
-        running_server.store(false, Ordering::Relaxed);
+        *interrupt_server.0.lock().unwrap() = false;
+        interrupt_server.1.notify_one();
     });
 
-    let running_interrupt = running.clone();
     ctrlc::set_handler(move || {
-        running_interrupt.store(false, Ordering::Relaxed);
+        println!("Got interrupt. Shutting down...");
+        *interrupt_interrupter.0.lock().unwrap() = false;
+        interrupt_interrupter.1.notify_one();
     }).expect("Error setting Ctrl-C handler");
+    while *(*interrupt_main).0.lock().unwrap() {
+        println!("Connection to Bluez");
+        let session = blurz::BluetoothSession::create_session(None).unwrap();
+        let adapter = blurz::BluetoothAdapter::init(&session).unwrap();
+        println!("Finding device");
+        let device = wait_fail_option!(
+            wait_fail!(adapter.get_device_list(), interrupt_main)
+                .iter()
+                .map(|path| blurz::BluetoothDevice::new(&session, path.clone()))
+                .filter(|d| d.get_name().unwrap() == "iBBQ")
+                .nth(0),
+            interrupt_main
+        );
+        println!("Connecting to device");
+        wait_fail!(device.connect(2_000), interrupt_main);
+        println!("Finding services");
+        let services: HashMap<_, _> = wait_fail!(device.get_gatt_services(), interrupt_main)
+            .iter()
+            .filter_map(|path| {
+                let service = blurz::BluetoothGATTService::new(&session, path.clone());
+                match service.get_uuid() {
+                    Ok(uuid) => Some((uuid, service)),
+                    Err(_) => None,
+                }
+            })
+            .collect();
+        let characteristics: HashMap<_, _> = services
+            .iter()
+            .flat_map(|(_, service)| {
+                match service.get_gatt_characteristics() {
+                    Ok(chars) => {
+                        chars
+                            .iter()
+                            .filter_map(|path| {
+                                let characteristic =
+                                    blurz::BluetoothGATTCharacteristic::new(&session, path.clone());
+                                match characteristic.get_uuid() {
+                                    Ok(uuid) => Some((uuid, characteristic)),
+                                    Err(_) => None,
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    }
+                    Err(_) => vec![],
+                }.into_iter()
+            })
+            .collect();
 
-    println!("Streaming data");
-    while running.load(Ordering::Relaxed) {
-        for event in session.incoming(1000).map(blurz::BluetoothEvent::from) {
+        println!("Authorising");
+        // Authorise to device with magic data
+        wait_fail!(
+            wait_fail_option!(
+                characteristics.get("0000fff2-0000-1000-8000-00805f9b34fb"),
+                interrupt_main
+            ).write_value(
+                vec![
+                    0x21,
+                    0x07,
+                    0x06,
+                    0x05,
+                    0x04,
+                    0x03,
+                    0x02,
+                    0x01,
+                    0xb8,
+                    0x22,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                ],
+                None,
+            ),
+            interrupt_main
+        );
+        println!("Starting data collection");
+        // Enable realtime data collection
+        wait_fail!(
+            wait_fail_option!(
+                characteristics.get("0000fff5-0000-1000-8000-00805f9b34fb"),
+                interrupt_main
+            ).write_value(vec![0x0B, 0x01, 0x00, 0x00, 0x00, 0x00], None),
+            interrupt_main
+        );
+        // Subscribe to realtime data collection
+        if !wait_fail!(
+            wait_fail_option!(
+                characteristics.get("0000fff4-0000-1000-8000-00805f9b34fb"),
+                interrupt_main
+            ).is_notifying(),
+            interrupt_main
+        )
+        {
+            wait_fail!(
+                characteristics["0000fff4-0000-1000-8000-00805f9b34fb"].start_notify(),
+                interrupt_main
+            );
+        }
 
-            match event {
-                Some(blurz::BluetoothEvent::Value { object_path, value }) => {
-                    if object_path ==
-                        characteristics["0000fff4-0000-1000-8000-00805f9b34fb"].get_id()
-                    {
-                        for probe in 0..value.len() / 2 {
-                            let temp =
-                                byteorder::LittleEndian::read_u16(&value[probe * 2..probe * 2 + 2]);
-                            gauge.with_label_values(&[&probe.to_string()]).set(
-                                if temp ==
-                                    65526
-                                {
-                                    std::f64::NAN
-                                } else {
-                                    temp as f64 / 10.0
-                                },
-                            );
 
+        println!("Streaming data");
+        while *(*interrupt_main).0.lock().unwrap() {
+            for event in session.incoming(1000).map(blurz::BluetoothEvent::from) {
+
+                match event {
+                    Some(blurz::BluetoothEvent::Value { object_path, value }) => {
+                        if object_path ==
+                            characteristics["0000fff4-0000-1000-8000-00805f9b34fb"].get_id()
+                        {
+                            for probe in 0..value.len() / 2 {
+                                let temp = byteorder::LittleEndian::read_u16(
+                                    &value[probe * 2..probe * 2 + 2],
+                                );
+                                gauge.with_label_values(&[&probe.to_string()]).set(
+                                    if temp ==
+                                        65526
+                                    {
+                                        std::f64::NAN
+                                    } else {
+                                        temp as f64 / 10.0
+                                    },
+                                );
+
+                            }
                         }
                     }
-                }
-                _ => {}
+                    _ => {}
 
+                }
             }
         }
+        println!("Disconnecting from device");
+        wait_fail!(
+            characteristics["0000fff4-0000-1000-8000-00805f9b34fb"].stop_notify(),
+            interrupt_main
+        );
     }
-    println!("Disconnecting from device");
-    characteristics["0000fff4-0000-1000-8000-00805f9b34fb"]
-        .stop_notify()
-        .unwrap();
     println!("Stop server");
     server.join().unwrap();
 }
