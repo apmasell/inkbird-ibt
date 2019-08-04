@@ -1,0 +1,9 @@
+[package]
+name = "inkbird-ibt"
+version = "0.1.0"
+authors = ["Andre Masella <andre@masella.name>"]
+edition = "2018"
+
+[dependencies]
+blurz = "0.4.0"
+byteorder = "1"
